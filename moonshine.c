@@ -20,6 +20,14 @@
 #include <unistd.h>
 #endif
 
+/* ───────────────── SIMD support ───────────────── */
+
+#if defined(__aarch64__)
+  #include <arm_neon.h>
+#elif defined(__x86_64__) || defined(_M_X64)
+  #include <immintrin.h>
+#endif
+
 /* ───────────────── Constants ───────────────── */
 
 #define EOS_TOKEN   2
@@ -328,6 +336,70 @@ static void free_tokenizer(Tokenizer *tok) {
 
 /* ───────────────── Math ops ───────────────── */
 
+/* SIMD dot product: sum of a[i]*b[i] */
+static inline float vec_dot(const float *a, const float *b, int n) {
+    float sum = 0;
+    int i = 0;
+#if defined(__aarch64__)
+    float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a+i),   vld1q_f32(b+i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a+i+4), vld1q_f32(b+i+4));
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    for (; i + 4 <= n; i += 4)
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a+i), vld1q_f32(b+i));
+    sum = vaddvq_f32(acc0);
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 acc = _mm256_setzero_ps();
+    for (; i + 8 <= n; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), acc);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_shuffle_ps(s, s, _MM_SHUFFLE(2,3,0,1)));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, _MM_SHUFFLE(0,0,0,2)));
+    sum = _mm_cvtss_f32(s);
+#elif defined(__SSE2__)
+    __m128 acc = _mm_setzero_ps();
+    for (; i + 4 <= n; i += 4)
+        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(a+i), _mm_loadu_ps(b+i)));
+    __m128 shuf = _mm_shuffle_ps(acc, acc, _MM_SHUFFLE(2,3,0,1));
+    __m128 sums = _mm_add_ps(acc, shuf);
+    shuf = _mm_shuffle_ps(sums, sums, _MM_SHUFFLE(0,0,0,2));
+    sums = _mm_add_ss(sums, shuf);
+    sum = _mm_cvtss_f32(sums);
+#endif
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+/* SIMD fused multiply-add: y[i] += alpha * x[i] */
+static inline void vec_fmadd(float *y, float alpha, const float *x, int n) {
+    int i = 0;
+#if defined(__aarch64__)
+    float32x4_t va = vdupq_n_f32(alpha);
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y+i,   vfmaq_f32(vld1q_f32(y+i),   va, vld1q_f32(x+i)));
+        vst1q_f32(y+i+4, vfmaq_f32(vld1q_f32(y+i+4), va, vld1q_f32(x+i+4)));
+    }
+    for (; i + 4 <= n; i += 4)
+        vst1q_f32(y+i, vfmaq_f32(vld1q_f32(y+i), va, vld1q_f32(x+i)));
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 va = _mm256_set1_ps(alpha);
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y+i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x+i), _mm256_loadu_ps(y+i)));
+#elif defined(__SSE2__)
+    __m128 va = _mm_set1_ps(alpha);
+    for (; i + 4 <= n; i += 4) {
+        __m128 vy = _mm_loadu_ps(y+i);
+        __m128 vx = _mm_loadu_ps(x+i);
+        _mm_storeu_ps(y+i, _mm_add_ps(vy, _mm_mul_ps(va, vx)));
+    }
+#endif
+    for (; i < n; i++) y[i] += alpha * x[i];
+}
+
 static inline float gelu_f(float x) {
     float c = 0.7978845608028654f;
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
@@ -346,12 +418,9 @@ static void matmul(float *out, const float *a, const float *b, int M, int K, int
             for (int i = i0; i < imax; i++) {
                 const float *ar = a + i*K;
                 float *cr = out + i*N + j0;
-                for (int k = k0; k < kmax; k++) {
-                    float aik = ar[k];
-                    const float *br = b + k*N + j0;
-                    int len = jmax - j0;
-                    for (int j = 0; j < len; j++) cr[j] += aik * br[j];
-                }
+                int len = jmax - j0;
+                for (int k = k0; k < kmax; k++)
+                    vec_fmadd(cr, ar[k], b + k*N + j0, len);
             }
         }
 }
@@ -405,14 +474,23 @@ static int conv1d_outlen(int L, int K, int S) { return (L - K) / S + 1; }
 static void conv1d(float *out, const float *in, const float *w,
                    const float *bias, int ic, int oc, int il, int k, int s) {
     int ol = conv1d_outlen(il, k, s);
-    for (int o = 0; o < oc; o++)
-        for (int p = 0; p < ol; p++) {
-            float sum = bias ? bias[o] : 0;
-            int st = p * s;
-            for (int c = 0; c < ic; c++)
-                for (int ki = 0; ki < k; ki++)
-                    sum += in[c*il+st+ki] * w[(o*ic+c)*k+ki];
-            out[o*ol+p] = sum;
+    int patch = ic * k;
+    /* im2col: unroll input patches into [patch, ol] matrix */
+    float *col = (float *)malloc((size_t)patch * ol * sizeof(float));
+    for (int c = 0; c < ic; c++)
+        for (int ki = 0; ki < k; ki++) {
+            float *dst = col + (c*k + ki) * ol;
+            const float *src = in + c*il + ki;
+            for (int p = 0; p < ol; p++) dst[p] = src[p * s];
+        }
+    /* out[oc, ol] = w[oc, patch] × col[patch, ol] */
+    matmul(out, w, col, oc, patch, ol);
+    free(col);
+    if (bias)
+        for (int o = 0; o < oc; o++) {
+            float b = bias[o];
+            float *row = out + o*ol;
+            for (int p = 0; p < ol; p++) row[p] += b;
         }
 }
 
@@ -465,17 +543,15 @@ static void enc_self_attn(float *out, const float *x, int seq,
     float sc = 1.0f/sqrtf((float)HD);
     for (int h = 0; h < H; h++) {
         for (int i = 0; i < seq; i++) {
-            for (int j = 0; j < seq; j++) {
-                float dot=0; const float *qi=q+(i*H+h)*HD, *kj=k+(j*H+h)*HD;
-                for (int d=0;d<HD;d++) dot+=qi[d]*kj[d];
-                att[i*seq+j]=dot*sc;
-            }
+            const float *qi=q+(i*H+h)*HD;
+            for (int j = 0; j < seq; j++)
+                att[i*seq+j] = vec_dot(qi, k+(j*H+h)*HD, HD) * sc;
             softmax(att+i*seq,seq);
         }
         for (int i = 0; i < seq; i++) {
-            float *oi=out+i*D+h*HD; for (int d=0;d<HD;d++) oi[d]=0;
-            for (int j=0;j<seq;j++) { float w=att[i*seq+j]; const float *vj=v+(j*H+h)*HD;
-                for (int d=0;d<HD;d++) oi[d]+=w*vj[d]; }
+            float *oi=out+i*D+h*HD; memset(oi, 0, HD*sizeof(float));
+            for (int j=0;j<seq;j++)
+                vec_fmadd(oi, att[i*seq+j], v+(j*H+h)*HD, HD);
         }
     }
     memcpy(att,out,tot*sizeof(float));
@@ -582,12 +658,12 @@ static void dec_self_attn(float *out, const float *x, int pos,
     float sc=1.0f/sqrtf((float)HD); float *ab=(float*)malloc(kvl*sizeof(float));
     for (int h=0;h<H;h++) {
         float *qh=q+h*HD;
-        for (int j=0;j<kvl;j++) { float dot=0; const float *kj=kv->self_k+j*D+h*HD;
-            for (int d=0;d<HD;d++) dot+=qh[d]*kj[d]; ab[j]=dot*sc; }
+        for (int j=0;j<kvl;j++)
+            ab[j] = vec_dot(qh, kv->self_k+j*D+h*HD, HD) * sc;
         softmax(ab,kvl);
-        float *oh=out+h*HD; for (int d=0;d<HD;d++) oh[d]=0;
-        for (int j=0;j<kvl;j++) { float w=ab[j]; const float *vj=kv->self_v+j*D+h*HD;
-            for (int d=0;d<HD;d++) oh[d]+=w*vj[d]; }
+        float *oh=out+h*HD; memset(oh, 0, HD*sizeof(float));
+        for (int j=0;j<kvl;j++)
+            vec_fmadd(oh, ab[j], kv->self_v+j*D+h*HD, HD);
     }
     free(ab); float *tmp=(float*)malloc(D*sizeof(float)); memcpy(tmp,out,D*sizeof(float));
     linear(out,tmp,ly->sa_o_proj,NULL,1,D,D); free(tmp); free(q); free(k); free(v);
@@ -605,12 +681,12 @@ static void dec_cross_attn(float *out, const float *x, const float *enc, int ele
     float sc=1.0f/sqrtf((float)HD); float *ab=(float*)malloc(elen*sizeof(float));
     for (int h=0;h<H;h++) {
         float *qh=q+h*HD;
-        for (int j=0;j<elen;j++) { float dot=0; const float *kj=kv->cross_k+j*D+h*HD;
-            for (int d=0;d<HD;d++) dot+=qh[d]*kj[d]; ab[j]=dot*sc; }
+        for (int j=0;j<elen;j++)
+            ab[j] = vec_dot(qh, kv->cross_k+j*D+h*HD, HD) * sc;
         softmax(ab,elen);
-        float *oh=out+h*HD; for (int d=0;d<HD;d++) oh[d]=0;
-        for (int j=0;j<elen;j++) { float w=ab[j]; const float *vj=kv->cross_v+j*D+h*HD;
-            for (int d=0;d<HD;d++) oh[d]+=w*vj[d]; }
+        float *oh=out+h*HD; memset(oh, 0, HD*sizeof(float));
+        for (int j=0;j<elen;j++)
+            vec_fmadd(oh, ab[j], kv->cross_v+j*D+h*HD, HD);
     }
     free(ab); float *tmp=(float*)malloc(D*sizeof(float)); memcpy(tmp,out,D*sizeof(float));
     linear(out,tmp,ly->ca_o_proj,NULL,1,D,D); free(tmp); free(q);
