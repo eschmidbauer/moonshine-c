@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# local
+notes.txt
+.venv
+test_process
+models
+test.wav
+__pycache__
