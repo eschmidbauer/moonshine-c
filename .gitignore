@@ -61,3 +61,4 @@ test_process
 models
 test.wav
 __pycache__
+test_streaming

@@ -42,10 +42,19 @@
 #define CONV3_K 3
 #define CONV3_S 2
 
+/* Maximum encoder layers supported for streaming sliding-window config. */
+#define MAX_ENC_LAYERS 16
+
 /* ───────────────── Internal types ───────────────── */
 
 typedef struct {
     int dim, num_heads, head_dim, rotary_dim, mlp_dim, vocab_size, num_layers;
+    /* Streaming decoder extras (0 in batch models) */
+    int use_silu;    /* 1 = SiLU gating in decoder MLP, 0 = GELU */
+    int max_pos_emb; /* positional embedding table size (streaming only) */
+    /* Streaming encoder extras */
+    int frame_len;                          /* PCM samples per frame */
+    int sliding_windows[MAX_ENC_LAYERS][2]; /* [left, right] per layer */
 } ModelConfig;
 
 typedef struct {
@@ -230,6 +239,56 @@ static const float *get_weight(const WeightFile *wf, const char *name) {
     return (const float *)(wf->data + t->offset);
 }
 
+/* Skip a JSON value of any type (scalar, array, object) without interpreting it. */
+static const char *skip_json_value(const char *p, const char *e) __attribute__((unused));
+static const char *skip_json_value(const char *p, const char *e) {
+    p = skip_ws(p, e);
+    if (p >= e) return p;
+    if (*p == '"') {
+        p++;
+        while (p < e && *p != '"') { if (*p == '\\') p++; p++; }
+        if (p < e) p++;
+    } else if (*p == '[' || *p == '{') {
+        char open = *p, close = (*p == '[') ? ']' : '}';
+        p++; int depth = 1;
+        while (p < e && depth > 0) {
+            if (*p == '"') { p++; while (p < e && *p != '"') { if (*p=='\\') p++; p++; } }
+            else if (*p == open)  depth++;
+            else if (*p == close) depth--;
+            p++;
+        }
+    } else {
+        while (p < e && *p != ',' && *p != '}' && *p != ']') p++;
+    }
+    return p;
+}
+
+/* Parse [[l0,r0],[l1,r1],...] into windows[][2], return updated pointer. */
+static const char *parse_sliding_windows(const char *p, const char *e,
+                                          int windows[][2], int *count) {
+    *count = 0;
+    p = skip_ws(p, e); if (p >= e || *p != '[') return p; p++;
+    while (p < e && *p != ']') {
+        p = skip_ws(p, e);
+        if (*p == ',') { p++; p = skip_ws(p, e); }
+        if (*p == ']') break;
+        if (*p != '[') break;
+        p++;
+        int64_t l = 0, r = 0;
+        p = skip_ws(p, e); p = parse_int64(p, e, &l);
+        p = skip_ws(p, e); if (p < e && *p == ',') p++;
+        p = skip_ws(p, e); p = parse_int64(p, e, &r);
+        p = skip_ws(p, e); if (p < e && *p == ']') p++;
+        if (*count < MAX_ENC_LAYERS) {
+            windows[*count][0] = (int)l;
+            windows[*count][1] = (int)r;
+            (*count)++;
+        }
+    }
+    if (p < e && *p == ']') p++;
+    return p;
+}
+
 static int load_config(const WeightFile *wf, ModelConfig *cfg) {
     const TensorInfo *t = find_tensor(wf, "_config");
     if (!t) return -1;
@@ -247,14 +306,22 @@ static int load_config(const WeightFile *wf, ModelConfig *cfg) {
         p = skip_ws(p, end);
         if (*p == ':') p++;
         p = skip_ws(p, end);
-        int64_t val; p = parse_int64(p, end, &val);
-        if      (strcmp(key, "dim") == 0)        cfg->dim = (int)val;
-        else if (strcmp(key, "num_heads") == 0)   cfg->num_heads = (int)val;
-        else if (strcmp(key, "head_dim") == 0)    cfg->head_dim = (int)val;
-        else if (strcmp(key, "rotary_dim") == 0)  cfg->rotary_dim = (int)val;
-        else if (strcmp(key, "mlp_dim") == 0)     cfg->mlp_dim = (int)val;
-        else if (strcmp(key, "vocab_size") == 0)  cfg->vocab_size = (int)val;
-        else if (strcmp(key, "num_layers") == 0)  cfg->num_layers = (int)val;
+        if (strcmp(key, "sliding_windows") == 0) {
+            int n = 0;
+            p = parse_sliding_windows(p, end, cfg->sliding_windows, &n);
+        } else {
+            int64_t val; p = parse_int64(p, end, &val);
+            if      (strcmp(key, "dim") == 0)         cfg->dim        = (int)val;
+            else if (strcmp(key, "num_heads") == 0)    cfg->num_heads  = (int)val;
+            else if (strcmp(key, "head_dim") == 0)     cfg->head_dim   = (int)val;
+            else if (strcmp(key, "rotary_dim") == 0)   cfg->rotary_dim = (int)val;
+            else if (strcmp(key, "mlp_dim") == 0)      cfg->mlp_dim    = (int)val;
+            else if (strcmp(key, "vocab_size") == 0)   cfg->vocab_size = (int)val;
+            else if (strcmp(key, "num_layers") == 0)   cfg->num_layers = (int)val;
+            else if (strcmp(key, "frame_len") == 0)    cfg->frame_len  = (int)val;
+            else if (strcmp(key, "use_silu") == 0)     cfg->use_silu   = (int)val;
+            else if (strcmp(key, "max_pos_emb") == 0)  cfg->max_pos_emb= (int)val;
+        }
         free(key);
     }
     return 0;
@@ -403,6 +470,10 @@ static inline void vec_fmadd(float *y, float alpha, const float *x, int n) {
 static inline float gelu_f(float x) {
     float c = 0.7978845608028654f;
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
+}
+
+static inline float silu_f(float x) {
+    return x / (1.0f + expf(-x));
 }
 
 #define TILE 32
@@ -697,7 +768,10 @@ static void dec_mlp(float *out, const float *x, const DecoderLayer *ly, const Mo
     float *h=(float*)malloc(2*MD*sizeof(float));
     linear(h,x,ly->fc1,ly->fc1_bias,1,D,2*MD);
     float *mb=(float*)malloc(MD*sizeof(float));
-    for (int i=0;i<MD;i++) mb[i]=gelu_f(h[MD+i])*h[i];
+    if (c->use_silu)
+        for (int i=0;i<MD;i++) mb[i]=silu_f(h[MD+i])*h[i];
+    else
+        for (int i=0;i<MD;i++) mb[i]=gelu_f(h[MD+i])*h[i];
     linear(out,mb,ly->fc2,ly->fc2_bias,1,MD,D); free(h); free(mb);
 }
 
@@ -793,6 +867,364 @@ const char *moonshine_transcribe(const moonshine_model *model,
     int enc_len;
     float *enc_hidden = encoder_forward(&model->enc, pcm_f32, num_samples, &enc_len);
     if (!enc_hidden) return NULL;
+
+    KVCache *caches = kv_alloc(&model->dec.cfg, enc_len);
+
+    int tokens[MAX_TOKENS];
+    int num_tokens = 0;
+    tokens[num_tokens++] = START_TOKEN;
+
+    float duration = num_samples / 16000.0f;
+    int max_len = (int)ceilf(duration * 6.5f);
+    if (max_len > MAX_TOKENS - 1) max_len = MAX_TOKENS - 1;
+
+    for (int step = 0; step < max_len; step++) {
+        float *logits = decoder_step(&model->dec, tokens[num_tokens-1], step,
+                                     enc_hidden, enc_len, caches);
+        int best = 0;
+        for (int i = 1; i < model->dec.cfg.vocab_size; i++)
+            if (logits[i] > logits[best]) best = i;
+        free(logits);
+        tokens[num_tokens++] = best;
+        if (best == EOS_TOKEN) break;
+    }
+
+    state->last_result = tokens_to_text(model->tok, tokens, num_tokens);
+
+    free(enc_hidden);
+    kv_free(caches, model->dec.cfg.num_layers);
+
+    return state->last_result;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * STREAMING MODEL
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── Streaming encoder internal types ─────────────────────────────── */
+
+typedef struct {
+    const float *log_k;          /* scalar: learned asinh compression param   */
+    const float *linear_w;       /* [frame_len, dim] (pre-transposed at export) */
+    const float *conv1_w;        /* [dim*2, dim, 5] causal conv                */
+    const float *conv1_b;        /* [dim*2]                                    */
+    const float *conv2_w;        /* [dim, dim*2, 5] causal conv                */
+    const float *conv2_b;        /* [dim]                                      */
+} SEncEmbedder;
+
+typedef struct {
+    const float *input_ln_w;     /* (gamma + 1.0 baked in at export)          */
+    const float *post_ln_w;
+    const float *q_proj, *k_proj, *v_proj, *o_proj;
+    const float *fc1, *fc1_bias, *fc2, *fc2_bias;
+} SEncLayer;
+
+typedef struct {
+    ModelConfig cfg;             /* dim, num_heads, head_dim, mlp_dim, etc.   */
+    SEncEmbedder emb;
+    SEncLayer *layers;
+    const float *final_norm_w;
+} StreamingEncoder;
+
+/* Streaming model: streaming encoder + reused Decoder + Tokenizer */
+struct moonshine_streaming_model {
+    StreamingEncoder senc;
+    Decoder dec;
+    Tokenizer *tok;
+    WeightFile *enc_wf, *dec_wf;
+    const float *pos_emb_w;      /* [max_pos, dec_dim] positional bias         */
+    char info_str[256];
+};
+
+/* ── Streaming encoder load ────────────────────────────────────────── */
+
+static void streaming_encoder_load(StreamingEncoder *senc, const WeightFile *wf) {
+    load_config(wf, &senc->cfg);
+    ModelConfig *c = &senc->cfg;
+
+    senc->emb.log_k     = get_weight(wf, "embedder.log_k");
+    senc->emb.linear_w  = get_weight(wf, "embedder.linear.weight");
+    senc->emb.conv1_w   = get_weight(wf, "embedder.conv1.weight");
+    senc->emb.conv1_b   = get_weight(wf, "embedder.conv1.bias");
+    senc->emb.conv2_w   = get_weight(wf, "embedder.conv2.weight");
+    senc->emb.conv2_b   = get_weight(wf, "embedder.conv2.bias");
+
+    int nl = c->num_layers;
+    senc->layers = (SEncLayer *)calloc(nl, sizeof(SEncLayer));
+    for (int i = 0; i < nl; i++) {
+        char n[128]; SEncLayer *l = &senc->layers[i];
+        #define SL(f,fmt) snprintf(n,sizeof(n),fmt,i); l->f = get_weight(wf,n)
+        SL(input_ln_w, "layers.%d.input_layernorm.weight");
+        SL(post_ln_w,  "layers.%d.post_attention_layernorm.weight");
+        SL(q_proj, "layers.%d.self_attn.q_proj.weight");
+        SL(k_proj, "layers.%d.self_attn.k_proj.weight");
+        SL(v_proj, "layers.%d.self_attn.v_proj.weight");
+        SL(o_proj, "layers.%d.self_attn.o_proj.weight");
+        SL(fc1,      "layers.%d.mlp.fc1.weight");
+        SL(fc1_bias, "layers.%d.mlp.fc1.bias");
+        SL(fc2,      "layers.%d.mlp.fc2.weight");
+        SL(fc2_bias, "layers.%d.mlp.fc2.bias");
+        #undef SL
+    }
+    senc->final_norm_w = get_weight(wf, "final_norm.weight");
+}
+
+/* ── Causal conv1d (left-pad by kernel-1 zeros, stride s) ─────────── */
+
+static int causal_conv1d_outlen(int il, int s) {
+    return (il - 1) / s + 1;
+}
+
+/* in[ic, il] → out[oc, outlen].  Weight layout: [oc, ic, k] (row-major). */
+static void causal_conv1d(float *out, const float *in, const float *w,
+                           const float *bias, int ic, int oc, int il, int k, int s) {
+    int pad = k - 1;
+    int pil = il + pad;
+    float *padded = (float *)calloc((size_t)ic * pil, sizeof(float));
+    for (int c = 0; c < ic; c++)
+        memcpy(padded + c * pil + pad, in + c * il, (size_t)il * sizeof(float));
+    conv1d(out, padded, w, bias, ic, oc, pil, k, s);
+    free(padded);
+}
+
+/* ── Streaming encoder self-attention (sliding window, no RoPE) ───── */
+
+static void senc_self_attn(float *out, const float *x, int seq,
+                            const SEncLayer *ly, const ModelConfig *c,
+                            int left, int right, float *work) {
+    int D=c->dim, H=c->num_heads, HD=c->head_dim, tot=seq*D;
+    float *q=work, *k=q+tot, *v=k+tot;
+    linear(q,x,ly->q_proj,NULL,seq,D,D);
+    linear(k,x,ly->k_proj,NULL,seq,D,D);
+    linear(v,x,ly->v_proj,NULL,seq,D,D);
+    float sc = 1.0f / sqrtf((float)HD);
+    /* Scratch buffer for one query's window scores (worst case = full seq). */
+    float *ab = (float *)malloc((size_t)seq * sizeof(float));
+    for (int h = 0; h < H; h++) {
+        for (int qi = 0; qi < seq; qi++) {
+            int kmin = qi - left + 1; if (kmin < 0) kmin = 0;
+            int kmax = qi + (right > 0 ? right - 1 : 0);
+            if (kmax >= seq) kmax = seq - 1;
+            int wsize = kmax - kmin + 1;
+            const float *qh = q + (qi * H + h) * HD;
+            for (int ki = 0; ki < wsize; ki++) {
+                int kp = kmin + ki;
+                ab[ki] = vec_dot(qh, k + (kp * H + h) * HD, HD) * sc;
+            }
+            softmax(ab, wsize);
+            float *oh = out + (qi * H + h) * HD;
+            memset(oh, 0, (size_t)HD * sizeof(float));
+            for (int ki = 0; ki < wsize; ki++) {
+                int kp = kmin + ki;
+                vec_fmadd(oh, ab[ki], v + (kp * H + h) * HD, HD);
+            }
+        }
+    }
+    free(ab);
+    /* Apply o_proj */
+    float *tmp = (float *)malloc((size_t)tot * sizeof(float));
+    memcpy(tmp, out, (size_t)tot * sizeof(float));
+    linear(out, tmp, ly->o_proj, NULL, seq, D, D);
+    free(tmp);
+}
+
+/* ── Streaming encoder MLP (simple: fc1 → gelu → fc2, no gating) ─── */
+
+static void senc_mlp(float *out, const float *x, int seq,
+                     const SEncLayer *ly, const ModelConfig *c, float *work) {
+    int D=c->dim, MD=c->mlp_dim;
+    linear(work, x, ly->fc1, ly->fc1_bias, seq, D, MD);
+    for (int i = 0; i < seq * MD; i++) work[i] = gelu_f(work[i]);
+    linear(out, work, ly->fc2, ly->fc2_bias, seq, MD, D);
+}
+
+/* ── Streaming encoder forward ─────────────────────────────────────── */
+
+static float *streaming_encoder_forward(const StreamingEncoder *senc,
+                                         const float *pcm, int n_samples,
+                                         int *out_len) {
+    const ModelConfig *c = &senc->cfg;
+    int D = c->dim, FL = c->frame_len;
+    int T = n_samples / FL;
+    if (T <= 0) { *out_len = 0; return NULL; }
+
+    /* ── Step 1: CMVN per frame ── */
+    float *frames = (float *)malloc((size_t)T * FL * sizeof(float));
+    for (int t = 0; t < T; t++) {
+        const float *f = pcm + t * FL;
+        float mean = 0;
+        for (int i = 0; i < FL; i++) mean += f[i];
+        mean /= FL;
+        float ss = 0;
+        for (int i = 0; i < FL; i++) {
+            float v = f[i] - mean;
+            frames[t * FL + i] = v;
+            ss += v * v;
+        }
+        float inv_rms = 1.0f / sqrtf(ss / FL + 1e-6f);
+        for (int i = 0; i < FL; i++) frames[t * FL + i] *= inv_rms;
+    }
+
+    /* ── Step 2: Asinh compression: asinh(exp(log_k) * x) ── */
+    float k = expf(senc->emb.log_k[0]);
+    for (int i = 0; i < T * FL; i++) {
+        float v = k * frames[i];
+        frames[i] = logf(v + sqrtf(v * v + 1.0f)); /* asinh */
+    }
+
+    /* ── Step 3: Linear projection + SiLU: [T, FL] @ [FL, D] → [T, D] ── */
+    float *proj = (float *)malloc((size_t)T * D * sizeof(float));
+    matmul(proj, frames, senc->emb.linear_w, T, FL, D);
+    free(frames);
+    for (int i = 0; i < T * D; i++) proj[i] = silu_f(proj[i]);
+
+    /* ── Step 4: Transpose to channel-first [D, T] for causal conv1d ── */
+    float *ch = (float *)malloc((size_t)D * T * sizeof(float));
+    for (int t = 0; t < T; t++)
+        for (int d = 0; d < D; d++)
+            ch[d * T + t] = proj[t * D + d];
+    free(proj);
+
+    /* ── Step 5: Causal conv1d #1: [D, T] → [D*2, T1], SiLU ── */
+    int T1 = causal_conv1d_outlen(T, 2);
+    float *c1 = (float *)malloc((size_t)(D * 2) * T1 * sizeof(float));
+    causal_conv1d(c1, ch, senc->emb.conv1_w, senc->emb.conv1_b, D, D*2, T, 5, 2);
+    free(ch);
+    for (int i = 0; i < D * 2 * T1; i++) c1[i] = silu_f(c1[i]);
+
+    /* ── Step 6: Causal conv1d #2: [D*2, T1] → [D, T2] ── */
+    int T2 = causal_conv1d_outlen(T1, 2);
+    float *c2 = (float *)malloc((size_t)D * T2 * sizeof(float));
+    causal_conv1d(c2, c1, senc->emb.conv2_w, senc->emb.conv2_b, D*2, D, T1, 5, 2);
+    free(c1);
+
+    /* ── Step 7: Transpose back to time-first [T2, D] ── */
+    float *x = (float *)malloc((size_t)T2 * D * sizeof(float));
+    for (int t = 0; t < T2; t++)
+        for (int d = 0; d < D; d++)
+            x[t * D + d] = c2[d * T2 + t];
+    free(c2);
+
+    /* ── Step 8: Encoder transformer layers ── */
+    size_t wsz = (size_t)T2 * D * 3; /* q+k+v work for attention */
+    size_t msz = (size_t)T2 * c->mlp_dim;
+    if (msz > wsz) wsz = msz;
+    float *work = (float *)malloc(wsz * sizeof(float));
+    float *tmp  = (float *)malloc((size_t)T2 * D * sizeof(float));
+
+    for (int li = 0; li < c->num_layers; li++) {
+        const SEncLayer *ly = &senc->layers[li];
+        int left  = c->sliding_windows[li][0];
+        int right = c->sliding_windows[li][1];
+
+        /* Pre-attention LayerNorm */
+        layer_norm(tmp, x, ly->input_ln_w, NULL, T2, D);
+
+        /* Sliding-window self-attention (no RoPE) */
+        float *ao = (float *)malloc((size_t)T2 * D * sizeof(float));
+        senc_self_attn(ao, tmp, T2, ly, c, left, right, work);
+        for (int j = 0; j < T2 * D; j++) x[j] += ao[j];
+        free(ao);
+
+        /* Post-attention LayerNorm */
+        layer_norm(tmp, x, ly->post_ln_w, NULL, T2, D);
+
+        /* MLP */
+        float *mo = (float *)malloc((size_t)T2 * D * sizeof(float));
+        senc_mlp(mo, tmp, T2, ly, c, work);
+        for (int j = 0; j < T2 * D; j++) x[j] += mo[j];
+        free(mo);
+    }
+
+    /* ── Step 9: Final LayerNorm ── */
+    layer_norm(tmp, x, senc->final_norm_w, NULL, T2, D);
+    memcpy(x, tmp, (size_t)T2 * D * sizeof(float));
+
+    free(work); free(tmp);
+    *out_len = T2;
+    return x;
+}
+
+/* ── Streaming model public API ────────────────────────────────────── */
+
+moonshine_streaming_model *moonshine_streaming_model_load(const char *model_dir) {
+    char path[512];
+
+    snprintf(path, sizeof(path), "%s/encoder.bin", model_dir);
+    WeightFile *enc_wf = load_weights(path);
+    if (!enc_wf) return NULL;
+
+    snprintf(path, sizeof(path), "%s/decoder.bin", model_dir);
+    WeightFile *dec_wf = load_weights(path);
+    if (!dec_wf) { free_weights(enc_wf); return NULL; }
+
+    snprintf(path, sizeof(path), "%s/tokenizer.bin", model_dir);
+    Tokenizer *tok = load_tokenizer(path);
+    if (!tok) { free_weights(enc_wf); free_weights(dec_wf); return NULL; }
+
+    moonshine_streaming_model *m =
+        (moonshine_streaming_model *)calloc(1, sizeof(moonshine_streaming_model));
+    m->enc_wf = enc_wf;
+    m->dec_wf = dec_wf;
+    m->tok    = tok;
+
+    streaming_encoder_load(&m->senc, enc_wf);
+    decoder_load(&m->dec, dec_wf);
+
+    /* pos_emb is stored in the decoder weight file */
+    const TensorInfo *pe = find_tensor(dec_wf, "pos_emb.weight");
+    m->pos_emb_w = pe ? (const float *)(dec_wf->data + pe->offset) : NULL;
+
+    const ModelConfig *ec = &m->senc.cfg;
+    const ModelConfig *dc = &m->dec.cfg;
+    snprintf(m->info_str, sizeof(m->info_str),
+             "streaming enc_dim=%d enc_layers=%d dec_dim=%d dec_layers=%d "
+             "frame_len=%d vocab=%d",
+             ec->dim, ec->num_layers, dc->dim, dc->num_layers,
+             ec->frame_len, dc->vocab_size);
+
+    return m;
+}
+
+void moonshine_streaming_model_free(moonshine_streaming_model *m) {
+    if (!m) return;
+    free(m->senc.layers);
+    free(m->dec.layers);
+    free_weights(m->enc_wf);
+    free_weights(m->dec_wf);
+    free_tokenizer(m->tok);
+    free(m);
+}
+
+const char *moonshine_streaming_model_info(const moonshine_streaming_model *m) {
+    return m ? m->info_str : NULL;
+}
+
+const char *moonshine_streaming_transcribe(const moonshine_streaming_model *model,
+                                           moonshine_state *state,
+                                           const float *pcm_f32,
+                                           int num_samples) {
+    if (!model || !state || !pcm_f32 || num_samples <= 0) return NULL;
+
+    free(state->last_result);
+    state->last_result = NULL;
+
+    int enc_len;
+    float *enc_hidden = streaming_encoder_forward(&model->senc, pcm_f32,
+                                                   num_samples, &enc_len);
+    if (!enc_hidden || enc_len == 0) return NULL;
+
+    /* Add learned positional embeddings to encoder output before cross-attn. */
+    if (model->pos_emb_w) {
+        int D = model->dec.cfg.dim;
+        int lim = enc_len < model->dec.cfg.max_pos_emb
+                  ? enc_len : model->dec.cfg.max_pos_emb;
+        for (int t = 0; t < lim; t++) {
+            const float *pe = model->pos_emb_w + t * D;
+            float *h        = enc_hidden        + t * D;
+            for (int j = 0; j < D; j++) h[j] += pe[j];
+        }
+    }
 
     KVCache *caches = kv_alloc(&model->dec.cfg, enc_len);
 

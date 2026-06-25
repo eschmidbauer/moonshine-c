@@ -70,6 +70,38 @@ const char *moonshine_transcribe(const moonshine_model *model,
                                  const float *pcm_f32,
                                  int num_samples);
 
+/* ── Streaming model (immutable, thread-safe) ─────────────────────── */
+
+/* Streaming models (tiny-streaming, small-streaming, medium-streaming) use a
+ * different encoder architecture: frame-based CMVN + asinh compression +
+ * linear projection + 2x causal conv1d with per-layer sliding-window
+ * attention.  The decoder is structurally identical to the batch decoder but
+ * uses SiLU gating and adds learned positional embeddings to the encoder
+ * output before cross-attention.
+ *
+ * Load once, share across threads.  Each concurrent request needs its own
+ * moonshine_state (same type as the batch model). */
+typedef struct moonshine_streaming_model moonshine_streaming_model;
+
+/* Load streaming model files from a directory.
+ * The directory must contain: encoder.bin, decoder.bin, tokenizer.bin
+ * Returns NULL on failure. */
+moonshine_streaming_model *moonshine_streaming_model_load(const char *model_dir);
+
+/* Free streaming model and all weight data. */
+void moonshine_streaming_model_free(moonshine_streaming_model *model);
+
+/* Return a string describing the streaming model.
+ * Valid until moonshine_streaming_model_free(). */
+const char *moonshine_streaming_model_info(const moonshine_streaming_model *model);
+
+/* Transcribe 16 kHz mono float32 PCM audio using a streaming model.
+ * Same concurrency contract as moonshine_transcribe(). */
+const char *moonshine_streaming_transcribe(const moonshine_streaming_model *model,
+                                           moonshine_state *state,
+                                           const float *pcm_f32,
+                                           int num_samples);
+
 #ifdef __cplusplus
 }
 #endif

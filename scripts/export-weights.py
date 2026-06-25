@@ -8,8 +8,9 @@ Output layout:
   models/<model>/tokenizer.bin
 
 Usage:
-    python scripts/export-weights.py                # exports tiny and base
-    python scripts/export-weights.py --model tiny   # tiny only
+    python scripts/export-weights.py                       # exports tiny and base
+    python scripts/export-weights.py --model tiny          # tiny only
+    python scripts/export-weights.py --model tiny-streaming
 
 Requirements:
     pip install -r scripts/requirements.txt
@@ -31,6 +32,12 @@ MODELS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "models"))
 HF_MODELS = {
     "tiny": "usefulsensors/moonshine-tiny",
     "base": "usefulsensors/moonshine-base",
+}
+
+HF_MODELS_STREAMING = {
+    "tiny-streaming":   "UsefulSensors/moonshine-streaming-tiny",
+    "small-streaming":  "UsefulSensors/moonshine-streaming-small",
+    "medium-streaming": "UsefulSensors/moonshine-streaming-medium",
 }
 
 MAGIC = b"MWTS"
@@ -103,7 +110,7 @@ def download_and_convert_tokenizer(output_dir, hf_model):
 
 
 def export_model(model_name, output_dir):
-    """Export float32 weights from HuggingFace."""
+    """Export float32 weights from HuggingFace (batch models: tiny, base)."""
     from transformers import AutoModel, AutoConfig
     import torch  # noqa: F401 — needed by transformers
 
@@ -200,14 +207,168 @@ def export_model(model_name, output_dir):
     download_and_convert_tokenizer(output_dir, hf_model)
 
 
+def export_streaming_model(model_name, output_dir):
+    """Export streaming model weights from HuggingFace (tiny-streaming, small-streaming, medium-streaming).
+
+    Streaming models differ from batch models in three key ways:
+      1. Encoder uses frame-based CMVN + asinh + linear + 2x causal-conv1d with
+         per-layer sliding-window attention (no global self-attention, no RoPE).
+      2. Decoder MLP uses SiLU gating instead of GELU.
+      3. Decoder adds learned positional embeddings to encoder output before
+         cross-attention (pos_emb.weight).
+
+    Encoder LayerNorm uses unit_offset (gamma stored as 0-init, effective weight
+    is gamma + 1.0).  We bake the +1.0 in at export time so the C engine can use
+    the standard layer_norm path unchanged.
+    """
+    from transformers import AutoModelForSpeechSeq2Seq, AutoConfig
+    import torch  # noqa: F401
+
+    hf_model = HF_MODELS_STREAMING[model_name]
+    print(f"\n=== Exporting streaming weights for {model_name} ===")
+    print(f"Loading model {hf_model}...")
+
+    hf_config = AutoConfig.from_pretrained(hf_model)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(hf_model)
+    sd = model.state_dict()
+
+    enc_cfg = hf_config.encoder_config
+    dim       = enc_cfg.hidden_size
+    num_heads = enc_cfg.num_attention_heads
+    head_dim  = enc_cfg.head_dim
+    mlp_dim   = enc_cfg.intermediate_size
+    enc_layers = enc_cfg.num_hidden_layers
+    frame_len  = int(round(enc_cfg.sample_rate * enc_cfg.frame_ms / 1000.0))  # 80
+    sliding_windows = enc_cfg.sliding_windows  # list of [left, right] per layer
+
+    # Decoder dimensions (may differ from encoder)
+    dec_dim       = hf_config.hidden_size
+    dec_num_heads = hf_config.num_attention_heads
+    dec_head_dim  = hf_config.head_dim
+    dec_mlp_dim   = hf_config.intermediate_size * 2  # gated MLP stores 2x intermediate
+    dec_layers    = hf_config.num_hidden_layers
+    vocab_size    = hf_config.vocab_size
+    rope_factor   = hf_config.rope_parameters.get("partial_rotary_factor", 1.0)
+    rotary_dim    = int(dec_head_dim * rope_factor)
+    if rotary_dim % 2 != 0:
+        rotary_dim += 1
+    max_pos = hf_config.max_position_embeddings
+
+    print(f"  Encoder: dim={dim} heads={num_heads} hd={head_dim} mlp={mlp_dim} "
+          f"layers={enc_layers} frame_len={frame_len}")
+    print(f"  Decoder: dim={dec_dim} heads={dec_num_heads} hd={dec_head_dim} "
+          f"rotary_dim={rotary_dim} layers={dec_layers} vocab={vocab_size}")
+    print(f"  Sliding windows: {sliding_windows}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- Streaming encoder ----
+    enc_weights = {}
+
+    # Embedder weights
+    enc_weights["embedder.log_k"] = sd["model.encoder.embedder.comp.log_k"].numpy().reshape(1)
+    # linear.weight: [dim, frame_len] → transpose to [frame_len, dim] for C matmul
+    enc_weights["embedder.linear.weight"] = sd["model.encoder.embedder.linear.weight"].numpy().T
+    # conv weights: [oc, ic, k] (no transpose needed — stored as [oc, ic*k] row-major)
+    enc_weights["embedder.conv1.weight"] = sd["model.encoder.embedder.conv1.weight"].numpy()
+    enc_weights["embedder.conv1.bias"]   = sd["model.encoder.embedder.conv1.bias"].numpy()
+    enc_weights["embedder.conv2.weight"] = sd["model.encoder.embedder.conv2.weight"].numpy()
+    enc_weights["embedder.conv2.bias"]   = sd["model.encoder.embedder.conv2.bias"].numpy()
+
+    # Encoder layers
+    for i in range(enc_layers):
+        pfx = f"model.encoder.layers.{i}"
+        # Unit-offset LayerNorm: effective weight = stored_gamma + 1.0
+        enc_weights[f"layers.{i}.input_layernorm.weight"] = (
+            sd[f"{pfx}.input_layernorm.gamma"].numpy() + 1.0
+        )
+        enc_weights[f"layers.{i}.post_attention_layernorm.weight"] = (
+            sd[f"{pfx}.post_attention_layernorm.gamma"].numpy() + 1.0
+        )
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            enc_weights[f"layers.{i}.self_attn.{proj}.weight"] = (
+                sd[f"{pfx}.self_attn.{proj}.weight"].numpy().T
+            )
+        enc_weights[f"layers.{i}.mlp.fc1.weight"] = sd[f"{pfx}.mlp.fc1.weight"].numpy().T
+        enc_weights[f"layers.{i}.mlp.fc1.bias"]   = sd[f"{pfx}.mlp.fc1.bias"].numpy()
+        enc_weights[f"layers.{i}.mlp.fc2.weight"] = sd[f"{pfx}.mlp.fc2.weight"].numpy().T
+        enc_weights[f"layers.{i}.mlp.fc2.bias"]   = sd[f"{pfx}.mlp.fc2.bias"].numpy()
+
+    enc_weights["final_norm.weight"] = sd["model.encoder.final_norm.gamma"].numpy() + 1.0
+
+    enc_config = {
+        "dim": dim,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "mlp_dim": mlp_dim,
+        "num_layers": enc_layers,
+        "frame_len": frame_len,
+        "sliding_windows": sliding_windows,
+    }
+    print("Exporting streaming encoder...")
+    write_bin(enc_weights, os.path.join(output_dir, "encoder.bin"), enc_config)
+
+    # ---- Streaming decoder ----
+    # Same structural layout as batch decoder but:
+    #   - use_silu=1  (MLP gating uses SiLU instead of GELU)
+    #   - pos_emb.weight stored (added to encoder output before cross-attn)
+    #   - proj_out.weight is separate (not tied to embed_tokens)
+    dec_weights = {}
+    dec_weights["embed_tokens.weight"] = sd["model.decoder.embed_tokens.weight"].numpy()
+    dec_weights["norm.weight"]         = sd["model.decoder.norm.weight"].numpy()
+    # proj_out is a separate tensor (tie_word_embeddings=False)
+    dec_weights["proj_out.weight"]     = sd["proj_out.weight"].numpy().T
+    # Learned positional embeddings added to encoder output in cross-attention
+    dec_weights["pos_emb.weight"]      = sd["model.decoder.pos_emb.weight"].numpy()
+
+    for i in range(dec_layers):
+        pfx = f"model.decoder.layers.{i}"
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            dec_weights[f"layers.{i}.self_attn.{proj}.weight"] = (
+                sd[f"{pfx}.self_attn.{proj}.weight"].numpy().T
+            )
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            dec_weights[f"layers.{i}.encoder_attn.{proj}.weight"] = (
+                sd[f"{pfx}.encoder_attn.{proj}.weight"].numpy().T
+            )
+        # fc1 outputs 2*intermediate for gated MLP; fc2 takes intermediate → dim
+        dec_weights[f"layers.{i}.mlp.fc1.weight"] = sd[f"{pfx}.mlp.fc1.weight"].numpy().T
+        dec_weights[f"layers.{i}.mlp.fc1.bias"]   = sd[f"{pfx}.mlp.fc1.bias"].numpy()
+        dec_weights[f"layers.{i}.mlp.fc2.weight"] = sd[f"{pfx}.mlp.fc2.weight"].numpy().T
+        dec_weights[f"layers.{i}.mlp.fc2.bias"]   = sd[f"{pfx}.mlp.fc2.bias"].numpy()
+        # Standard nn.LayerNorm (no unit_offset) — weight stored as-is
+        dec_weights[f"layers.{i}.input_layernorm.weight"]          = sd[f"{pfx}.input_layernorm.weight"].numpy()
+        dec_weights[f"layers.{i}.post_attention_layernorm.weight"]  = sd[f"{pfx}.post_attention_layernorm.weight"].numpy()
+        dec_weights[f"layers.{i}.final_layernorm.weight"]           = sd[f"{pfx}.final_layernorm.weight"].numpy()
+
+    # dec_mlp_dim: fc1 outputs 2*intermediate, fc2 takes intermediate
+    # Store intermediate_size in config (C engine halves it when use_silu=1)
+    dec_config = {
+        "dim": dec_dim,
+        "num_heads": dec_num_heads,
+        "head_dim": dec_head_dim,
+        "rotary_dim": rotary_dim,
+        "mlp_dim": hf_config.intermediate_size,
+        "vocab_size": vocab_size,
+        "num_layers": dec_layers,
+        "use_silu": 1,
+        "max_pos_emb": max_pos,
+    }
+    print("Exporting streaming decoder...")
+    write_bin(dec_weights, os.path.join(output_dir, "decoder.bin"), dec_config)
+
+    download_and_convert_tokenizer(output_dir, hf_model)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export Moonshine float32 weights to .bin files for the C engine"
     )
     parser.add_argument(
         "--model", action="append", default=None,
-        choices=["tiny", "base"],
-        help="Model to export (default: tiny and base). Can be specified multiple times.",
+        choices=list(HF_MODELS.keys()) + list(HF_MODELS_STREAMING.keys()),
+        help="Model to export. Can be specified multiple times. "
+             "Default: tiny and base.",
     )
     parser.add_argument(
         "--output-dir", default=None,
@@ -223,7 +384,10 @@ def main():
         else:
             output_dir = os.path.join(MODELS_DIR, model_name)
 
-        export_model(model_name, output_dir)
+        if model_name in HF_MODELS_STREAMING:
+            export_streaming_model(model_name, output_dir)
+        else:
+            export_model(model_name, output_dir)
 
     print("\nDone.")
 
